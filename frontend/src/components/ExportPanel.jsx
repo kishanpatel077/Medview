@@ -2,6 +2,7 @@ import { useState } from 'react';
 import { FiDownload, FiInfo, FiFileText } from 'react-icons/fi';
 import Button from './Button.jsx';
 import Loader from './Loader.jsx';
+import { API_URL } from '../config/api.js';
 
 export default function ExportPanel({ study, sessionId, activeSeriesUid }) {
   const [exportFormat, setExportFormat] = useState('png');
@@ -15,7 +16,7 @@ export default function ExportPanel({ study, sessionId, activeSeriesUid }) {
     try {
       const seriesParam = activeSeriesUid ? `&series_uid=${activeSeriesUid}` : '';
       const response = await fetch(
-        `http://127.0.0.1:8000/api/convert?study_id=${sessionId}&target_format=${exportFormat}${seriesParam}`,
+        `${API_URL}/api/convert?study_id=${sessionId}&target_format=${exportFormat}${seriesParam}`,
         {
           method: 'POST',
         }

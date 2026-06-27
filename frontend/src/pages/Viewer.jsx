@@ -12,6 +12,7 @@ import UploadZone from '../components/UploadZone.jsx';
 import ViewerToolbar from '../components/ViewerToolbar.jsx';
 import Loader from '../components/Loader.jsx';
 import { parsePixelSpacing } from '../utils/viewportCoords.js';
+import { API_URL } from '../config/api.js';
 
 
 // Available viewport layouts options
@@ -134,7 +135,7 @@ export default function Viewer() {
     formData.append('file', file);
 
     try {
-      const response = await fetch('http://127.0.0.1:8000/api/upload', {
+      const response = await fetch(`${API_URL}/api/upload`, {
         method: 'POST',
         body: formData,
       });
@@ -174,7 +175,7 @@ export default function Viewer() {
     try {
       const seriesParam = activeSeriesUid ? `&series_uid=${activeSeriesUid}` : '';
       const response = await fetch(
-        `http://127.0.0.1:8000/api/convert?study_id=${sessionId}&target_format=${format}${seriesParam}`,
+        `${API_URL}/api/convert?study_id=${sessionId}&target_format=${format}${seriesParam}`,
         { method: 'POST' }
       );
 

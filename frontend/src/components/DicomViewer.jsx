@@ -5,6 +5,7 @@ import {
   calculateMeasurement,
   containerToImage,
 } from '../utils/viewportCoords.js';
+import { API_URL } from '../config/api.js';
 import ctAxial from '../assets/ct_axial.png';
 import mriSag from '../assets/mri_sag.png';
 import xrChest from '../assets/xr_chest.png';
@@ -91,8 +92,7 @@ function ScanPanel({
   onMeasurementAdd,
   pixelSpacing = null,
 }) {
-  const backendUrl = 'http://127.0.0.1:8000';
-  const imageUrl = isDemo ? img : (img ? `${backendUrl}${img}` : null);
+  const imageUrl = isDemo ? img : (img ? `${API_URL}${img}` : null);
   const containerRef = useRef(null);
   const imgRef = useRef(null);
   const dragRef = useRef(null);
