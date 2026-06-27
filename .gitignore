@@ -1,0 +1,26 @@
+node_modules
+dist
+.npm-cache
+.npm-cache-next
+.pnpm-store
+.corepack
+.corepack-yarn
+.yarn/cache
+.yarn/install-state.gz
+
+# Python
+__pycache__/
+*.py[cod]
+.venv
+venv/
+.env
+.env.*
+
+# OS / editor
+.DS_Store
+Thumbs.db
+*.log
+
+# Build / temp
+frontend/dist
+*.zip

@@ -1,0 +1,16 @@
+# FastAPI backend packages
+fastapi>=0.110.0
+uvicorn[standard]>=0.28.0
+
+# Medical DICOM parsing packages
+pydicom>=2.4.0
+numpy>=1.20.0
+
+# Image generation & conversions packages
+pillow>=10.2.0
+python-multipart>=0.0.9
+
+# Video generation packages
+imageio>=2.34.0
+imageio-ffmpeg>=0.4.9
+
