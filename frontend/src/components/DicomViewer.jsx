@@ -1,11 +1,12 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { motion } from 'framer-motion';
 import MeasurementOverlay from './MeasurementOverlay.jsx';
+import SliceImage from './SliceImage.jsx';
 import {
   calculateMeasurement,
   containerToImage,
 } from '../utils/viewportCoords.js';
-import { API_URL } from '../config/api.js';
+import { getPrefetchUrls, prefetchSliceUrls, resolveSliceUrl } from '../utils/slicePrefetch.js';
 import ctAxial from '../assets/ct_axial.png';
 import mriSag from '../assets/mri_sag.png';
 import xrChest from '../assets/xr_chest.png';
@@ -91,10 +92,10 @@ function ScanPanel({
   onMeasurementDraftChange,
   onMeasurementAdd,
   pixelSpacing = null,
+  prefetchUrls = [],
 }) {
-  const imageUrl = isDemo ? img : (img ? `${API_URL}${img}` : null);
+  const imageUrl = resolveSliceUrl(img, isDemo);
   const containerRef = useRef(null);
-  const imgRef = useRef(null);
   const dragRef = useRef(null);
   const [isDragging, setIsDragging] = useState(false);
   const [viewportSize, setViewportSize] = useState({ cw: 0, ch: 0, nw: 0, nh: 0 });
@@ -103,16 +104,15 @@ function ScanPanel({
   const canZoom = interactive && activeTool === 'Zoom';
   const isMeasuring = interactive && activeTool === 'Measurement Tool' && active;
 
-  const measureViewport = useCallback(() => {
+  const measureViewport = useCallback((imageEl) => {
     const container = containerRef.current;
-    const image = imgRef.current;
     if (!container) return;
 
     setViewportSize((prev) => ({
       cw: container.clientWidth,
       ch: container.clientHeight,
-      nw: image?.naturalWidth || prev.nw,
-      nh: image?.naturalHeight || prev.nh,
+      nw: imageEl?.naturalWidth || prev.nw,
+      nh: imageEl?.naturalHeight || prev.nh,
     }));
   }, []);
 
@@ -157,6 +157,10 @@ function ScanPanel({
     observer.observe(container);
     return () => observer.disconnect();
   }, [measureViewport, imageUrl]);
+
+  useEffect(() => {
+    prefetchSliceUrls(prefetchUrls);
+  }, [prefetchUrls]);
 
   useEffect(() => {
     if (!interactive || !onPanChange || !viewportSize.cw) return;
@@ -343,14 +347,12 @@ function ScanPanel({
         onMouseDown={handleMouseDown}
       >
         {imageUrl ? (
-          <img
-            ref={imgRef}
+          <SliceImage
             src={imageUrl}
             alt={title}
             className="absolute left-1/2 top-1/2 max-h-full max-w-full select-none object-contain opacity-90"
             style={imageStyle}
-            draggable={false}
-            onLoad={measureViewport}
+            onReady={measureViewport}
           />
         ) : (
           <div className="flex h-full items-center justify-center text-xs text-slate-500">No Image Data</div>
@@ -398,6 +400,9 @@ export default function DicomViewer({
 }) {
   const activeSeries = seriesList?.find((s) => s.seriesInstanceUid === activeSeriesUid);
   const isDemoMode = !activeSeries || !activeSeries.instances || activeSeries.instances.length === 0;
+  const prefetchUrls = isDemoMode
+    ? []
+    : getPrefetchUrls(activeSeries?.instances || [], activeSliceIndex, 5, false);
 
   const numPanels = layout === '1' ? 1 : layout === '2' ? 2 : 4;
   const gridClass =
@@ -423,6 +428,7 @@ export default function DicomViewer({
     onMeasurementDraftChange,
     onMeasurementAdd,
     pixelSpacing,
+    prefetchUrls,
   };
 
   if (isDemoMode) {

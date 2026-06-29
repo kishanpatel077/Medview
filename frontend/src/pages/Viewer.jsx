@@ -13,6 +13,7 @@ import ViewerToolbar from '../components/ViewerToolbar.jsx';
 import Loader from '../components/Loader.jsx';
 import { parsePixelSpacing } from '../utils/viewportCoords.js';
 import { API_URL } from '../config/api.js';
+import { getPrefetchUrls, prefetchSliceUrls } from '../utils/slicePrefetch.js';
 
 
 // Available viewport layouts options
@@ -25,6 +26,39 @@ const LS_STUDY_KEY = 'medview_study';
 const LS_SESSION_KEY = 'medview_session';
 const LS_FILENAME_KEY = 'medview_filename';
 
+const uploadStudyZip = (formData, onProgress) =>
+  new Promise((resolve, reject) => {
+    const request = new XMLHttpRequest();
+    request.open('POST', `${API_URL}/api/upload`);
+
+    request.upload.onprogress = (event) => {
+      if (!event.lengthComputable) return;
+      const percent = Math.round((event.loaded / event.total) * 100);
+      onProgress(Math.min(100, Math.max(0, percent)));
+    };
+
+    request.onload = () => {
+      let payload = null;
+      try {
+        payload = JSON.parse(request.responseText || '{}');
+      } catch (_) {
+        reject(new Error('Server returned an invalid response.'));
+        return;
+      }
+
+      if (request.status >= 200 && request.status < 300) {
+        resolve(payload);
+        return;
+      }
+
+      reject(new Error(payload.detail || 'Failed to parse the ZIP file.'));
+    };
+
+    request.onerror = () => reject(new Error('Network error while uploading ZIP.'));
+    request.onabort = () => reject(new Error('ZIP upload was cancelled.'));
+    request.send(formData);
+  });
+
 export default function Viewer() {
   // --- STATE MANAGEMENT ---
   const [layout, setLayout] = useState('1');
@@ -33,6 +67,7 @@ export default function Viewer() {
   const [activeSliceIndex, setActiveSliceIndex] = useState(0);
   const [isLoading, setIsLoading] = useState(false);
   const [loadingMessage, setLoadingMessage] = useState('Extracting ZIP and parsing DICOM files...');
+  const [uploadProgress, setUploadProgress] = useState(null);
   const [error, setError] = useState(null);
   const [uploadedFileName, setUploadedFileName] = useState('');
 
@@ -126,6 +161,7 @@ export default function Viewer() {
     setStudy(null);
     setSessionId(null);
     setUploadedFileName('');
+    setUploadProgress(null);
     setActiveSeriesUid(null);
     setActiveSliceIndex(0);
     localStorage.removeItem(LS_STUDY_KEY);
@@ -137,6 +173,7 @@ export default function Viewer() {
   const handleUpload = async (file) => {
     setIsLoading(true);
     setLoadingMessage('Uploading ZIP to server...');
+    setUploadProgress(0);
     setError(null);
     const formData = new FormData();
     formData.append('file', file);
@@ -146,18 +183,16 @@ export default function Viewer() {
     }, 8000);
 
     try {
-      const response = await fetch(`${API_URL}/api/upload`, {
-        method: 'POST',
-        body: formData,
+      const data = await uploadStudyZip(formData, (percent) => {
+        setUploadProgress(percent);
+        if (percent >= 100) {
+          setLoadingMessage('Upload complete. Processing DICOM slices on server...');
+        } else {
+          setLoadingMessage(`Uploading ZIP to server... ${percent}%`);
+        }
       });
 
-      if (!response.ok) {
-        const errData = await response.json();
-        throw new Error(errData.detail || 'Failed to parse the ZIP file.');
-      }
-
       setLoadingMessage('Preparing viewer...');
-      const data = await response.json();
       if (data.status === 'success' && data.study) {
         setStudy(data.study);
         setSessionId(data.session_id);
@@ -178,6 +213,7 @@ export default function Viewer() {
     } finally {
       window.clearTimeout(uploadTimer);
       setIsLoading(false);
+      setUploadProgress(null);
       setLoadingMessage('Extracting ZIP and parsing DICOM files...');
     }
   };
@@ -229,6 +265,11 @@ export default function Viewer() {
   const maxSlices = instances.length;
   const activeSlice = instances[activeSliceIndex] || null;
   const pixelSpacing = parsePixelSpacing(activeSlice?.metadata);
+
+  useEffect(() => {
+    if (!maxSlices || !activeSeries?.instances) return;
+    prefetchSliceUrls(getPrefetchUrls(activeSeries.instances, activeSliceIndex, 6, false));
+  }, [activeSliceIndex, activeSeriesUid, maxSlices, activeSeries]);
 
   return (
     <PageTransition className="bg-slate-100 dark:bg-background">
@@ -435,6 +476,8 @@ export default function Viewer() {
                     onUpload={(f) => { handleUpload(f); setShowLeftPanel(false); }}
                     studyLoaded={!!study}
                     fileName={uploadedFileName}
+                    isUploading={isLoading}
+                    uploadProgress={uploadProgress}
                     onRemove={() => { handleRemoveStudy(); setShowLeftPanel(false); }}
                   />
                 </div>
@@ -461,6 +504,8 @@ export default function Viewer() {
               onUpload={handleUpload}
               studyLoaded={!!study}
               fileName={uploadedFileName}
+              isUploading={isLoading}
+              uploadProgress={uploadProgress}
               onRemove={handleRemoveStudy}
             />
           </div>
@@ -578,6 +623,20 @@ export default function Viewer() {
                 <div className="flex h-[280px] flex-col items-center justify-center gap-3 rounded-lg border border-slate-700 bg-slate-950 sm:h-[360px] xl:h-[400px]">
                   <Loader />
                   <p className="text-sm text-slate-400">{loadingMessage}</p>
+                  {uploadProgress !== null && (
+                    <div className="w-full max-w-xs px-4">
+                      <div className="mb-1 flex items-center justify-between text-[11px] font-semibold text-slate-400">
+                        <span>ZIP upload</span>
+                        <span>{uploadProgress}%</span>
+                      </div>
+                      <div className="h-2 overflow-hidden rounded-full bg-slate-800">
+                        <div
+                          className="h-full rounded-full bg-primary transition-all duration-200"
+                          style={{ width: `${uploadProgress}%` }}
+                        />
+                      </div>
+                    </div>
+                  )}
                 </div>
               ) : (
                 <DicomViewer
@@ -622,7 +681,8 @@ export default function Viewer() {
                 min={1}
                 type="range"
                 value={maxSlices > 0 ? activeSliceIndex + 1 : 1}
-                onChange={(e) => setActiveSliceIndex(parseInt(e.target.value) - 1)}
+                onChange={(e) => setActiveSliceIndex(parseInt(e.target.value, 10) - 1)}
+                onInput={(e) => setActiveSliceIndex(parseInt(e.target.value, 10) - 1)}
                 disabled={maxSlices <= 1}
               />
               <div className="mt-2 grid grid-cols-3 text-xs text-slate-500 dark:text-muted sm:mt-3">
@@ -690,6 +750,8 @@ export default function Viewer() {
             onUpload={handleUpload}
             studyLoaded={!!study}
             fileName={uploadedFileName}
+            isUploading={isLoading}
+            uploadProgress={uploadProgress}
             onRemove={handleRemoveStudy}
           />
         </div>

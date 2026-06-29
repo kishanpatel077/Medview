@@ -3,7 +3,15 @@ import { motion } from 'framer-motion';
 import { FiUploadCloud, FiCheckCircle, FiTrash2 } from 'react-icons/fi';
 import Button from './Button.jsx';
 
-export default function UploadZone({ compact = false, onUpload, studyLoaded = false, fileName = '', onRemove }) {
+export default function UploadZone({
+  compact = false,
+  onUpload,
+  studyLoaded = false,
+  fileName = '',
+  onRemove,
+  isUploading = false,
+  uploadProgress = null,
+}) {
   const fileInputRef = useRef(null);
 
   const handleFileChange = (e) => {
@@ -15,8 +23,46 @@ export default function UploadZone({ compact = false, onUpload, studyLoaded = fa
   };
 
   const triggerFileSelect = () => {
+    if (isUploading) return;
     fileInputRef.current?.click();
   };
+
+  if (isUploading) {
+    const progress = uploadProgress ?? 0;
+
+    return (
+      <motion.div
+        initial={{ opacity: 0, y: 4 }}
+        animate={{ opacity: 1, y: 0 }}
+        className={[
+          'rounded-lg border border-blue-400/60 bg-blue-500/[0.06] text-center dark:bg-blue-500/10',
+          compact ? 'p-4' : 'p-5 sm:p-8',
+        ].join(' ')}
+      >
+        <div className="mx-auto grid h-11 w-11 place-items-center rounded-md bg-primary text-white shadow-glow">
+          <span className="h-5 w-5 animate-spin rounded-full border-2 border-white/40 border-t-white" />
+        </div>
+        <h3 className={`mt-3 font-semibold text-slate-950 dark:text-white ${compact ? 'text-sm' : 'text-base'}`}>
+          Uploading ZIP
+        </h3>
+        <p className="mt-1 text-[11px] text-slate-500 dark:text-muted">
+          {progress >= 100 ? 'Processing DICOM slices...' : `${progress}% uploaded`}
+        </p>
+        <div className="mt-3">
+          <div className="mb-1 flex items-center justify-between text-[10px] font-semibold text-slate-500 dark:text-muted">
+            <span>Progress</span>
+            <span>{progress}%</span>
+          </div>
+          <div className="h-2 overflow-hidden rounded-full bg-slate-200 dark:bg-slate-800">
+            <div
+              className="h-full rounded-full bg-primary transition-all duration-200"
+              style={{ width: `${progress}%` }}
+            />
+          </div>
+        </div>
+      </motion.div>
+    );
+  }
 
   // ── Loaded state: show file name + Remove button ──
   if (studyLoaded) {
@@ -68,6 +114,7 @@ export default function UploadZone({ compact = false, onUpload, studyLoaded = fa
         ref={fileInputRef}
         onChange={handleFileChange}
         accept=".zip"
+        disabled={isUploading}
         className="hidden"
       />
       <div className="mx-auto grid h-11 w-11 place-items-center rounded-md bg-primary text-white shadow-glow">
@@ -82,7 +129,7 @@ export default function UploadZone({ compact = false, onUpload, studyLoaded = fa
         </p>
       )}
       <div className={`flex justify-center ${compact ? 'mt-3' : 'mt-4 sm:mt-5'}`}>
-        <Button className="w-full justify-center sm:w-auto" type="button" onClick={triggerFileSelect}>
+        <Button className="w-full justify-center sm:w-auto" type="button" onClick={triggerFileSelect} disabled={isUploading}>
           <FiUploadCloud size={15} />
           {compact ? 'Select ZIP' : 'Select ZIP File'}
         </Button>
