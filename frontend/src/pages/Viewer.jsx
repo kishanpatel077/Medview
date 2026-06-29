@@ -32,6 +32,7 @@ export default function Viewer() {
   const [activeSeriesUid, setActiveSeriesUid] = useState(null);
   const [activeSliceIndex, setActiveSliceIndex] = useState(0);
   const [isLoading, setIsLoading] = useState(false);
+  const [loadingMessage, setLoadingMessage] = useState('Extracting ZIP and parsing DICOM files...');
   const [error, setError] = useState(null);
   const [uploadedFileName, setUploadedFileName] = useState('');
 
@@ -100,6 +101,11 @@ export default function Viewer() {
   }, []);
 
   useEffect(() => {
+    if (!API_URL) return;
+    fetch(`${API_URL}/api/health`).catch(() => {});
+  }, []);
+
+  useEffect(() => {
     if (!activeSeriesUid) return;
     resetImageControls();
   }, [activeSeriesUid]);
@@ -130,9 +136,14 @@ export default function Viewer() {
   // --- ACTIONS & HANDLERS ---
   const handleUpload = async (file) => {
     setIsLoading(true);
+    setLoadingMessage('Uploading ZIP to server...');
     setError(null);
     const formData = new FormData();
     formData.append('file', file);
+
+    const uploadTimer = window.setTimeout(() => {
+      setLoadingMessage('Processing DICOM slices on server. Large studies can take 1-2 minutes on Render...');
+    }, 8000);
 
     try {
       const response = await fetch(`${API_URL}/api/upload`, {
@@ -145,6 +156,7 @@ export default function Viewer() {
         throw new Error(errData.detail || 'Failed to parse the ZIP file.');
       }
 
+      setLoadingMessage('Preparing viewer...');
       const data = await response.json();
       if (data.status === 'success' && data.study) {
         setStudy(data.study);
@@ -164,7 +176,9 @@ export default function Viewer() {
     } catch (e) {
       setError(e.message || 'An error occurred while uploading.');
     } finally {
+      window.clearTimeout(uploadTimer);
       setIsLoading(false);
+      setLoadingMessage('Extracting ZIP and parsing DICOM files...');
     }
   };
 
@@ -563,7 +577,7 @@ export default function Viewer() {
               {isLoading ? (
                 <div className="flex h-[280px] flex-col items-center justify-center gap-3 rounded-lg border border-slate-700 bg-slate-950 sm:h-[360px] xl:h-[400px]">
                   <Loader />
-                  <p className="text-sm text-slate-400">Extracting ZIP and parsing DICOM files...</p>
+                  <p className="text-sm text-slate-400">{loadingMessage}</p>
                 </div>
               ) : (
                 <DicomViewer

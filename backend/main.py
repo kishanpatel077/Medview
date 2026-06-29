@@ -1,10 +1,15 @@
 import os
+import io
+import json
 import zipfile
 import shutil
 import uuid
 import tempfile
+import threading
 from pathlib import Path
-from typing import Dict, List, Any
+from typing import Dict, List, Any, Optional, Tuple
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
 import numpy as np
 from PIL import Image
 import pydicom
@@ -13,6 +18,7 @@ from pydicom.errors import InvalidDicomError
 from fastapi import FastAPI, UploadFile, File, BackgroundTasks, HTTPException
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.staticfiles import StaticFiles
 
 # --- APP CONFIGURATION ---
@@ -26,6 +32,7 @@ app.add_middleware(
     allow_methods=["*"],  # Allows GET, POST, OPTIONS, etc.
     allow_headers=["*"],
 )
+app.add_middleware(GZipMiddleware, minimum_size=1000)
 
 # Establish temporary directory for processing uploaded studies
 TEMP_BASE_DIR = Path(tempfile.gettempdir()) / "medview_studies"
@@ -33,6 +40,9 @@ TEMP_BASE_DIR.mkdir(parents=True, exist_ok=True)
 
 # Mount directory as static folder to serve generated slice images directly via HTTP
 app.mount("/static", StaticFiles(directory=str(TEMP_BASE_DIR)), name="static")
+
+MAX_UPLOAD_WORKERS = int(os.getenv("MEDVIEW_UPLOAD_WORKERS", "4"))
+SKIP_ZIP_NAMES = {"Thumbs.db", ".DS_Store"}
 
 
 # --- HELPER FUNCTIONS ---
@@ -117,12 +127,176 @@ def get_slice_sorting_key(ds: pydicom.Dataset) -> float:
     return 0.0
 
 
+def should_skip_zip_member(name: str) -> bool:
+    if name.endswith("/"):
+        return True
+    basename = Path(name).name
+    if not basename or basename.startswith("._"):
+        return True
+    return basename in SKIP_ZIP_NAMES
+
+
+def pixels_to_uint8(pixels: np.ndarray, ds: pydicom.Dataset) -> np.ndarray:
+    values = pixels.astype(np.float32, copy=False)
+
+    if hasattr(ds, "RescaleSlope") and hasattr(ds, "RescaleIntercept"):
+        values = values * float(ds.RescaleSlope) + float(ds.RescaleIntercept)
+
+    if hasattr(ds, "WindowCenter") and hasattr(ds, "WindowWidth"):
+        wc = ds.WindowCenter
+        ww = ds.WindowWidth
+        if isinstance(wc, pydicom.multival.MultiValue):
+            wc = wc[0]
+        if isinstance(ww, pydicom.multival.MultiValue):
+            ww = ww[0]
+        val_min = float(wc) - (float(ww) / 2.0)
+        val_max = float(wc) + (float(ww) / 2.0)
+        values = np.clip(values, val_min, val_max)
+        values = ((values - val_min) / (val_max - val_min)) * 255.0
+    else:
+        p_min, p_max = values.min(), values.max()
+        if p_max > p_min:
+            values = ((values - p_min) / (p_max - p_min)) * 255.0
+        else:
+            values = np.zeros_like(values)
+
+    return values.astype(np.uint8)
+
+
+def build_metadata_rows(ds: pydicom.Dataset, study_uid: str, series_uid: str) -> List[List[str]]:
+    return [
+        ["Patient Name", clean_dicom_value(ds.get("PatientName", "Anonymous"))],
+        ["Patient ID", clean_dicom_value(ds.get("PatientID", "N/A"))],
+        ["Study UID", study_uid],
+        ["Study Date", clean_dicom_value(ds.get("StudyDate", "N/A"))],
+        ["Study Description", clean_dicom_value(ds.get("StudyDescription", "N/A"))],
+        ["Modality", clean_dicom_value(ds.get("Modality", "N/A"))],
+        ["Series UID", series_uid],
+        ["Series Description", clean_dicom_value(ds.get("SeriesDescription", "N/A"))],
+        ["Series Number", str(ds.get("SeriesNumber", "1"))],
+        ["Instance Number", str(ds.get("InstanceNumber", "1"))],
+        ["Slice Location", str(ds.get("SliceLocation", "N/A"))],
+        ["Columns / Width", str(ds.get("Columns", "N/A"))],
+        ["Rows / Height", str(ds.get("Rows", "N/A"))],
+        ["Spacing", str(clean_dicom_value(ds.get("PixelSpacing", "N/A")))],
+        ["Window Center", str(clean_dicom_value(ds.get("WindowCenter", "N/A")))],
+        ["Window Width", str(clean_dicom_value(ds.get("WindowWidth", "N/A")))],
+        ["Photometric", str(ds.get("PhotometricInterpretation", "MONOCHROME2"))],
+    ]
+
+
+def process_zip_member(
+    zip_ref: zipfile.ZipFile,
+    zip_lock: threading.Lock,
+    name: str,
+    study_id: str,
+    study_dir: Path,
+) -> Tuple[Optional[Dict[str, Any]], bool]:
+    try:
+        with zip_lock:
+            raw = zip_ref.read(name)
+    except Exception as exc:
+        print(f"Error reading ZIP member {name}: {exc}")
+        return None, True
+    return process_dicom_bytes(raw, study_id, study_dir)
+
+
+def process_dicom_bytes(
+    raw: bytes,
+    study_id: str,
+    study_dir: Path,
+) -> Tuple[Optional[Dict[str, Any]], bool]:
+    """
+    Parse one DICOM blob and write its PNG slice.
+    Returns (result_payload, had_error).
+  """
+    try:
+        ds = pydicom.dcmread(io.BytesIO(raw), force=True)
+        if "SOPInstanceUID" not in ds or "StudyInstanceUID" not in ds:
+            return None, False
+
+        study_uid = clean_dicom_value(ds.StudyInstanceUID)
+        series_uid = clean_dicom_value(ds.SeriesInstanceUID)
+        sop_uid = clean_dicom_value(ds.SOPInstanceUID)
+
+        has_image = False
+        png_name = f"{sop_uid}.png"
+        png_path = study_dir / png_name
+
+        if "PixelData" in ds:
+            try:
+                pixels = pixels_to_uint8(ds.pixel_array, ds)
+                Image.fromarray(pixels).save(png_path, format="PNG", compress_level=1, optimize=False)
+                has_image = True
+            except Exception as exc:
+                print(f"Error converting pixel data for instance {sop_uid}: {exc}")
+                return None, True
+
+        instance_data = {
+            "sopInstanceUid": sop_uid,
+            "instanceNumber": int(ds.get("InstanceNumber", 1)),
+            "sliceLocation": get_slice_sorting_key(ds),
+            "imageUrl": f"/static/{study_id}/{png_name}" if has_image else None,
+            "metadata": build_metadata_rows(ds, study_uid, series_uid),
+        }
+
+        study_meta = {
+            "studyInstanceUid": study_uid,
+            "patientName": clean_dicom_value(ds.get("PatientName", "Anonymous Patient")),
+            "patientId": clean_dicom_value(ds.get("PatientID", "N/A")),
+            "studyDate": clean_dicom_value(ds.get("StudyDate", "N/A")),
+            "studyDescription": clean_dicom_value(ds.get("StudyDescription", "DICOM Study")),
+            "modality": clean_dicom_value(ds.get("Modality", "MR")),
+        }
+        series_meta = {
+            "seriesInstanceUid": series_uid,
+            "seriesDescription": clean_dicom_value(
+                ds.get("SeriesDescription", f"Series {ds.get('SeriesNumber', 1)}")
+            ),
+            "seriesNumber": int(ds.get("SeriesNumber", 1)),
+            "modality": clean_dicom_value(ds.get("Modality", "MR")),
+        }
+
+        return {
+            "study_uid": study_uid,
+            "series_uid": series_uid,
+            "study_meta": study_meta,
+            "series_meta": series_meta,
+            "instance": instance_data,
+        }, False
+    except InvalidDicomError:
+        return None, False
+    except Exception as exc:
+        print(f"Error processing DICOM blob: {exc}")
+        return None, True
+
+
+def merge_processed_result(studies_data: Dict[str, Any], result: Dict[str, Any]) -> None:
+    study_uid = result["study_uid"]
+    series_uid = result["series_uid"]
+
+    if study_uid not in studies_data:
+        studies_data[study_uid] = {**result["study_meta"], "series": {}}
+
+    study = studies_data[study_uid]
+    if series_uid not in study["series"]:
+        study["series"][series_uid] = {**result["series_meta"], "instances": []}
+
+    study["series"][series_uid]["instances"].append(result["instance"])
+
+
 # --- ROUTE HANDLERS ---
 
 @app.get("/")
 def read_root():
     """Simple API check connection response."""
     return {"message": "MedView DICOM processing backend is running."}
+
+
+@app.get("/api/health")
+def health_check():
+    """Lightweight health endpoint used to warm the Render instance."""
+    return {"status": "ok", "service": "medview-backend"}
 
 
 @app.post("/api/upload")
@@ -135,235 +309,96 @@ def upload_dicom_zip(
     Extracts ZIP, parses metadata headers, rescales raw pixel matrices into PNGs,
     and returns a structured JSON payload of the study.
     """
-    # Trigger garbage collection on old sessions
-    cleanup_old_studies()
+    background_tasks.add_task(cleanup_old_studies)
 
     if not file.filename.endswith('.zip'):
         raise HTTPException(status_code=400, detail="Only ZIP files containing DICOM studies are supported.")
 
-    # Create a unique study session folder
     study_id = uuid.uuid4().hex
     study_dir = TEMP_BASE_DIR / study_id
     study_dir.mkdir(exist_ok=True)
 
     zip_path = study_dir / "uploaded_study.zip"
-    
-    # Step 1: Copy uploaded file stream onto local disk
+
     try:
         with open(zip_path, "wb") as f:
             shutil.copyfileobj(file.file, f)
     except Exception as e:
-        shutil.rmtree(study_dir)
+        shutil.rmtree(study_dir, ignore_errors=True)
         raise HTTPException(status_code=500, detail=f"Failed to save upload: {str(e)}")
-
-    # Step 2: Unzip the file
-    extract_dir = study_dir / "extracted"
-    extract_dir.mkdir(exist_ok=True)
-    
-    try:
-        with zipfile.ZipFile(zip_path, 'r') as zip_ref:
-            zip_ref.extractall(extract_dir)
-    except Exception as e:
-        shutil.rmtree(study_dir)
-        raise HTTPException(status_code=400, detail=f"Invalid ZIP file: {str(e)}")
-
-    # Step 3: Traverse folders recursively to find DICOM slices
-    dicom_files: List[Path] = []
-    for root, _, filenames in os.walk(extract_dir):
-        for name in filenames:
-            file_path = Path(root) / name
-            # Ignore hidden files or OS system artifacts
-            if name.startswith('._') or name == 'Thumbs.db' or '.DS_Store' in name:
-                continue
-            dicom_files.append(file_path)
-
-    if not dicom_files:
-        shutil.rmtree(study_dir)
-        raise HTTPException(status_code=400, detail="No files found in the uploaded ZIP.")
 
     studies_data: Dict[str, Any] = {}
     processed_count = 0
     errors_count = 0
 
-    # Step 4: Parse DICOM elements and extract pixel data
-    for file_path in dicom_files:
-        try:
-            ds = pydicom.dcmread(file_path, force=True)
-            # Ensure it is a valid DICOM file by checking for essential UIDs
-            if 'SOPInstanceUID' not in ds or 'StudyInstanceUID' not in ds:
-                continue
-            
-            study_uid = clean_dicom_value(ds.StudyInstanceUID)
-            series_uid = clean_dicom_value(ds.SeriesInstanceUID)
-            sop_uid = clean_dicom_value(ds.SOPInstanceUID)
-            
-            # Setup study record structure if parsing first slice
-            if study_uid not in studies_data:
-                studies_data[study_uid] = {
-                    "studyInstanceUid": study_uid,
-                    "patientName": clean_dicom_value(ds.get('PatientName', 'Anonymous Patient')),
-                    "patientId": clean_dicom_value(ds.get('PatientID', 'N/A')),
-                    "studyDate": clean_dicom_value(ds.get('StudyDate', 'N/A')),
-                    "studyDescription": clean_dicom_value(ds.get('StudyDescription', 'DICOM Study')),
-                    "modality": clean_dicom_value(ds.get('Modality', 'MR')),
-                    "series": {}
-                }
-            
-            study = studies_data[study_uid]
-            
-            # Setup series structure under study grouping
-            if series_uid not in study["series"]:
-                study["series"][series_uid] = {
-                    "seriesInstanceUid": series_uid,
-                    "seriesDescription": clean_dicom_value(ds.get('SeriesDescription', f"Series {ds.get('SeriesNumber', 1)}")),
-                    "seriesNumber": int(ds.get('SeriesNumber', 1)),
-                    "modality": clean_dicom_value(ds.get('Modality', 'MR')),
-                    "instances": []
-                }
-                
-            series = study["series"][series_uid]
-            
-            # Convert raw pixel arrays to web-ready formats
-            png_name = f"{sop_uid}.png"
-            png_path = study_dir / png_name
-            
-            has_image = False
-            metadata_rows = []
-            
-            if 'PixelData' in ds:
-                try:
-                    # Convert to raw float array
-                    pixels = ds.pixel_array.astype(float)
-                    
-                    # Apply Rescale Slope / Intercept adjustments (modality dependent)
-                    if hasattr(ds, 'RescaleSlope') and hasattr(ds, 'RescaleIntercept'):
-                        pixels = pixels * float(ds.RescaleSlope) + float(ds.RescaleIntercept)
-                        
-                    # Apply Window Center (WL) and Window Width (WW) contrast scaling
-                    if hasattr(ds, 'WindowCenter') and hasattr(ds, 'WindowWidth'):
-                        wc = ds.WindowCenter
-                        ww = ds.WindowWidth
-                        # Handle array values for multiple presets (select default index 0)
-                        if isinstance(wc, pydicom.multival.MultiValue):
-                            wc = wc[0]
-                        if isinstance(ww, pydicom.multival.MultiValue):
-                            ww = ww[0]
-                        
-                        val_min = float(wc) - (float(ww) / 2.0)
-                        val_max = float(wc) + (float(ww) / 2.0)
-                        
-                        # Clip elements outside window limits and rescale to 8-bit scale
-                        pixels = np.clip(pixels, val_min, val_max)
-                        pixels = ((pixels - val_min) / (val_max - val_min)) * 255.0
-                    else:
-                        # Fallback simple min-max normalization
-                        p_min, p_max = pixels.min(), pixels.max()
-                        if p_max > p_min:
-                            pixels = ((pixels - p_min) / (p_max - p_min)) * 255.0
-                        else:
-                            pixels = np.zeros_like(pixels)
-                            
-                    # Cast into 8-bit unsigned integer array
-                    pixels = pixels.astype(np.uint8)
-                    
-                    # Build and save PNG image slice
-                    img = Image.fromarray(pixels)
-                    img.save(png_path, 'PNG')
-                    has_image = True
-                except Exception as e:
-                    print(f"Error converting pixel data for instance {sop_uid}: {e}")
-                    errors_count += 1
-            
-            # Map key-value arrays for the frontend MetadataPanel structure
-            metadata_rows = [
-                ["Patient Name", clean_dicom_value(ds.get('PatientName', 'Anonymous'))],
-                ["Patient ID", clean_dicom_value(ds.get('PatientID', 'N/A'))],
-                ["Study UID", study_uid],
-                ["Study Date", clean_dicom_value(ds.get('StudyDate', 'N/A'))],
-                ["Study Description", clean_dicom_value(ds.get('StudyDescription', 'N/A'))],
-                ["Modality", clean_dicom_value(ds.get('Modality', 'N/A'))],
-                ["Series UID", series_uid],
-                ["Series Description", clean_dicom_value(ds.get('SeriesDescription', 'N/A'))],
-                ["Series Number", str(ds.get('SeriesNumber', '1'))],
-                ["Instance Number", str(ds.get('InstanceNumber', '1'))],
-                ["Slice Location", str(ds.get('SliceLocation', 'N/A'))],
-                ["Columns / Width", str(ds.get('Columns', 'N/A'))],
-                ["Rows / Height", str(ds.get('Rows', 'N/A'))],
-                ["Spacing", str(clean_dicom_value(ds.get('PixelSpacing', 'N/A')))],
-                ["Window Center", str(clean_dicom_value(ds.get('WindowCenter', 'N/A')))],
-                ["Window Width", str(clean_dicom_value(ds.get('WindowWidth', 'N/A')))],
-                ["Photometric", str(ds.get('PhotometricInterpretation', 'MONOCHROME2'))]
-            ]
-            
-            # Pack instance elements
-            instance_data = {
-                "sopInstanceUid": sop_uid,
-                "instanceNumber": int(ds.get('InstanceNumber', 1)),
-                "sliceLocation": get_slice_sorting_key(ds),
-                "imageUrl": f"/static/{study_id}/{png_name}" if has_image else None,
-                "metadata": metadata_rows
-            }
-            
-            series["instances"].append(instance_data)
-            processed_count += 1
-            
-        except InvalidDicomError:
-            # Not a valid DICOM file, skip it
-            continue
-        except Exception as e:
-            print(f"Error processing file {file_path.name}: {e}")
-            errors_count += 1
-
-    # Clean up the large extracted folder and zip file from disk
-    # We only keep the generated PNG slices to minimize storage overhead
     try:
-        shutil.rmtree(extract_dir)
-        if zip_path.exists():
-            zip_path.unlink()
-    except Exception as e:
-        print(f"Error cleaning up extracted files: {e}")
+        with zipfile.ZipFile(zip_path, "r") as zip_ref:
+            members = [name for name in zip_ref.namelist() if not should_skip_zip_member(name)]
+            if not members:
+                raise HTTPException(status_code=400, detail="No files found in the uploaded ZIP.")
 
-    # Verify if study loading succeeded
+            with ThreadPoolExecutor(max_workers=MAX_UPLOAD_WORKERS) as executor:
+                zip_lock = threading.Lock()
+                futures = {
+                    executor.submit(process_zip_member, zip_ref, zip_lock, name, study_id, study_dir): name
+                    for name in members
+                }
+
+                for future in as_completed(futures):
+                    result, had_error = future.result()
+                    if had_error:
+                        errors_count += 1
+                    if not result:
+                        continue
+                    merge_processed_result(studies_data, result)
+                    processed_count += 1
+    except HTTPException:
+        shutil.rmtree(study_dir, ignore_errors=True)
+        raise
+    except zipfile.BadZipFile as e:
+        shutil.rmtree(study_dir, ignore_errors=True)
+        raise HTTPException(status_code=400, detail=f"Invalid ZIP file: {str(e)}")
+    except Exception as e:
+        shutil.rmtree(study_dir, ignore_errors=True)
+        raise HTTPException(status_code=500, detail=f"Failed to process upload: {str(e)}")
+    finally:
+        try:
+            if zip_path.exists():
+                zip_path.unlink()
+        except Exception as e:
+            print(f"Error cleaning up uploaded ZIP: {e}")
+
     if not studies_data:
-        shutil.rmtree(study_dir)
+        shutil.rmtree(study_dir, ignore_errors=True)
         raise HTTPException(
-            status_code=400, 
-            detail="No valid DICOM files with pixel data could be parsed from the uploaded archive."
+            status_code=400,
+            detail="No valid DICOM files with pixel data could be parsed from the uploaded archive.",
         )
 
-    # Post-process, sort slices, and convert dictionary structures to list structures
     final_studies: List[Dict[str, Any]] = []
-    
+
     for study_uid, study_info in studies_data.items():
         series_list = []
         for series_uid, series_info in study_info["series"].items():
-            # Sort instances (slices) spatially (coordinates depth) first, then sequentially (instance number)
             series_info["instances"].sort(key=lambda x: (x["sliceLocation"], x["instanceNumber"]))
             series_list.append(series_info)
-            
-        # Sort series list by series numbers
+
         series_list.sort(key=lambda x: x["seriesNumber"])
-        
         study_info["series"] = series_list
         final_studies.append(study_info)
 
-    # Save metadata.json for reference in conversion endpoint (e.g. video creation)
     try:
-        import json
         with open(study_dir / "metadata.json", "w") as f:
             json.dump(final_studies[0], f)
     except Exception as e:
         print(f"Error saving metadata.json: {e}")
 
-    # Return the first study found in the payload
-    # IMPORTANT: We also return the internal session_id (UUID-based folder name)
-    # so the frontend can pass it to /api/convert instead of the DICOM studyInstanceUid.
     return JSONResponse(content={
         "status": "success",
         "processed": processed_count,
         "errors": errors_count,
         "session_id": study_id,
-        "study": final_studies[0]
+        "study": final_studies[0],
     })
 
 
